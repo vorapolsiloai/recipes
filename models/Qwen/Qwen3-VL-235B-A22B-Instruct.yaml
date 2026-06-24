@@ -43,6 +43,13 @@ features:
     args:
       - "--mm-encoder-tp-mode"
       - "data"
+  eagle3_speculative_decoding:
+    description: "EAGLE3 speculative decoding with the public RedHatAI draft model. Verified on AMD MI300X (gfx942/CDNA3) with the FP8 target. On ROCm this REQUIRES --attention-backend ROCM_AITER_FA; the default ROCM_ATTN path makes SD slower than baseline because the draft+verify forwards run every decode step (see vllm-project/vllm#46596)."
+    args:
+      - "--speculative-config"
+      - '{"model":"RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3","method":"eagle3","num_speculative_tokens":4}'
+      - "--attention-backend"
+      - "ROCM_AITER_FA"
 
 opt_in_features:
   - text_only
@@ -168,6 +175,37 @@ guide: |
   vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct \
     --tensor-parallel 4 \
     --mm-encoder-tp-mode data
+  ```
+
+  ### MI300X (FP8, EAGLE3 Speculative Decoding)
+
+  Target `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` + draft
+  `RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3` on a single 8-GPU node.
+  `--attention-backend ROCM_AITER_FA` is mandatory: the default ROCM_ATTN path
+  makes SD slower than baseline on ROCm (see vllm-project/vllm#46596). Roughly
+  halves SD TPOT vs the default selection.
+
+  ```bash
+  VLLM_USE_V1=1 \
+  VLLM_WORKER_MULTIPROC_METHOD=spawn \
+  VLLM_ROCM_USE_AITER=1 \
+  VLLM_ROCM_USE_AITER_MHA=1 \
+  VLLM_ROCM_USE_AITER_RMSNORM=0 \
+  VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=0 \
+  VLLM_RPC_TIMEOUT=300000 \
+  vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+    --tensor-parallel-size 8 \
+    --gpu-memory-utilization 0.94 \
+    --distributed-executor-backend mp \
+    --enable-chunked-prefill \
+    --max-model-len 16384 \
+    --max-num-seqs 32 \
+    --max-num-batched-tokens 8192 \
+    --mm-encoder-tp-mode data \
+    --enable-expert-parallel \
+    --attention-backend ROCM_AITER_FA \
+    --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["-rms_norm"],"pass_config":{"fuse_norm_quant":false}}' \
+    --speculative-config '{"model":"RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3","method":"eagle3","num_speculative_tokens":4}'
   ```
 
   ## Configuration Tips

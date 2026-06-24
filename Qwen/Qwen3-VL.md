@@ -240,5 +240,114 @@ vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
   --ignore-eos 
 ```
 
+### EAGLE3 Speculative Decoding (MI300X, FP8)
+
+Speculative decoding lowers time-per-output-token (TPOT) by drafting several
+tokens per step with a small draft model and verifying them in a single target
+forward pass. This configuration is verified on **AMD Instinct MI300X**
+(gfx942 / CDNA3) with the FP8 target and the public EAGLE3 draft:
+
+| Role | Hugging Face model id |
+|------|------------------------|
+| **Target** | `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` |
+| **Draft (EAGLE3)** | `RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3` |
+
+> ⚠️ **Required on ROCm: `--attention-backend ROCM_AITER_FA`.**
+> On vLLM v0.21+ the default ROCm attention selection picks `ROCM_ATTN`, whose
+> HIP paged-decode kernel falls back to Triton for Qwen3-235B's KV head sizes.
+> The speculative path runs the draft + verify forwards every decode step, so
+> this penalty is amplified and SD can end up **slower** than the baseline.
+> Selecting AITER FlashAttention (`ROCM_AITER_FA`) restores the fast path and
+> roughly **halves SD TPOT**. Tracking:
+> [vllm-project/vllm#46596](https://github.com/vllm-project/vllm/issues/46596).
+
+#### Start the server (FP8 target + EAGLE3 draft, TP8)
+
+Use the [`vllm/vllm-openai-rocm`](https://hub.docker.com/r/vllm/vllm-openai-rocm)
+image (v0.21.0+; v0.23.0 recommended) or the ROCm wheel from Step 1. Launch on a
+single 8-GPU MI300X node:
+
+```shell
+export VLLM_USE_V1="1"
+export VLLM_WORKER_MULTIPROC_METHOD="spawn"
+export VLLM_ROCM_USE_AITER="1"
+export VLLM_ROCM_USE_AITER_MHA="1"
+export VLLM_ROCM_USE_AITER_RMSNORM="0"
+export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT="0"   # keep 0 for the speculative-decoding path
+export VLLM_RPC_TIMEOUT="300000"
+
+vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+  --tensor-parallel-size 8 \
+  --gpu-memory-utilization 0.94 \
+  --distributed-executor-backend mp \
+  --enable-chunked-prefill \
+  --max-model-len 16384 \
+  --max-num-seqs 32 \
+  --max-num-batched-tokens 8192 \
+  --mm-encoder-tp-mode data \
+  --enable-expert-parallel \
+  --attention-backend ROCM_AITER_FA \
+  --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["-rms_norm"],"pass_config":{"fuse_norm_quant":false}}' \
+  --speculative-config '{"model":"RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3","method":"eagle3","num_speculative_tokens":4}'
+```
+
+During generation the server logs periodic
+`SpecDecoding metrics: Mean acceptance length: <N>` lines — the average number
+of tokens accepted per step (higher is better; ~3.0 on real multimodal prompts,
+lower on synthetic data).
+
+**Tuning notes**
+- `--attention-backend ROCM_AITER_FA` is the single most important flag for SD on
+  ROCm — do not omit it (see the warning above).
+- `num_speculative_tokens: 4` is a good default for this EAGLE3 draft; lower it if
+  acceptance is poor on your workload.
+- Keep `VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=0` for speculative decoding (the `=1`
+  shuffled layout is a dense-model AITER tuning knob, not used here).
+- SD helps most at low–moderate concurrency; at very high concurrency the target
+  is already compute-bound and the SD benefit shrinks.
+- For image-only serving add `--limit-mm-per-prompt '{"image":1,"video":0}'`.
+
+#### Run the benchmark
+
+From a separate terminal, with the **same** target id as `--model` (the draft is
+server-side only):
+
+```shell
+vllm bench serve \
+  --backend openai-chat \
+  --endpoint /v1/chat/completions \
+  --model Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+  --dataset-name random-mm \
+  --num-prompts 1000 \
+  --num-warmups 10 \
+  --max-concurrency 8 \
+  --random-input-len 1024 \
+  --random-output-len 512 \
+  --random-mm-base-items-per-request 1 \
+  --random-mm-limit-mm-per-prompt '{"image": 1, "video": 0}' \
+  --random-mm-bucket-config '{(512, 512, 1): 1.0}' \
+  --ignore-eos
+```
+
+> ℹ️ `random-mm` uses random tokens, giving a **low** acceptance length (~1.8)
+> that understates SD's benefit. For representative numbers, benchmark with real
+> multimodal prompts (e.g. a VisionArena/MMMU-style dataset), where acceptance
+> length reaches ~3.0.
+
+#### Measured impact (MI300X, FP8, EAGLE3, real MMMU prompts)
+
+Effect of `--attention-backend ROCM_AITER_FA` vs the default `ROCM_ATTN`
+selection (same config otherwise) — SD decode TPOT (ms) / output throughput (tok/s):
+
+| concurrency | default `ROCM_ATTN` | + `ROCM_AITER_FA` |
+|----|----|----|
+| 1  | 10.65 ms / 89 tok/s  | **5.31 ms / 197 tok/s** |
+| 4  | 13.89 ms / 225 tok/s | **6.60 ms / 596 tok/s** |
+| 8  | 18.64 ms / 393 tok/s | **8.24 ms / 798 tok/s** |
+| 16 | 24.67 ms / 399 tok/s | **11.12 ms / 1023 tok/s** |
+
+Acceptance length is unchanged by the attention backend — the speedup is pure
+attention-execution efficiency.
+
 
   
