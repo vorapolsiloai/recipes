@@ -349,5 +349,64 @@ selection (same config otherwise) — SD decode TPOT (ms) / output throughput (t
 Acceptance length is unchanged by the attention backend — the speedup is pure
 attention-execution efficiency.
 
+### EAGLE3 Speculative Decoding (MI350X / MI355X, FP8)
+
+The same target + EAGLE3 draft re-tuned on **AMD Instinct MI350X / MI355X**
+(gfx950 / CDNA4, 288 GB/GPU). Two things shift the optimum relative to MI300X:
+
+- **Deeper draft.** `num_speculative_tokens: 5` (vs 4 on MI300X) gives the best
+  TPOT — CDNA4's faster attention makes the extra draft/verify work pay off.
+- **More KV-cache headroom.** With 288 GB/GPU the engine reports ~300× the
+  concurrency needed for a 16 384-token window, so running batches can scale well
+  past `--max-num-seqs 32`. Use `--max-num-seqs 64 --max-num-batched-tokens 16384`
+  to ride that headroom at high concurrency.
+
+`--attention-backend ROCM_AITER_FA` remains mandatory
+([vllm-project/vllm#46596](https://github.com/vllm-project/vllm/issues/46596)).
+
+#### Start the server (FP8 target + EAGLE3 draft, TP8)
+
+```shell
+export VLLM_USE_V1="1"
+export VLLM_WORKER_MULTIPROC_METHOD="spawn"
+export VLLM_ROCM_USE_AITER="1"
+export VLLM_ROCM_USE_AITER_MHA="1"
+export VLLM_ROCM_USE_AITER_RMSNORM="0"
+export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT="0"
+export VLLM_RPC_TIMEOUT="300000"
+
+vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+  --tensor-parallel-size 8 \
+  --gpu-memory-utilization 0.94 \
+  --distributed-executor-backend mp \
+  --enable-chunked-prefill \
+  --max-model-len 16384 \
+  --max-num-seqs 64 \
+  --max-num-batched-tokens 16384 \
+  --mm-encoder-tp-mode data \
+  --enable-expert-parallel \
+  --attention-backend ROCM_AITER_FA \
+  --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["-rms_norm"],"pass_config":{"fuse_norm_quant":false}}' \
+  --speculative-config '{"model":"RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3","method":"eagle3","num_speculative_tokens":5}'
+```
+
+#### Measured impact (MI350X, FP8, EAGLE3, padded-ISL MMMU, ISL 1024 / OSL 512)
+
+EAGLE3 SD (`num_speculative_tokens: 5`) vs the **same target with speculative
+decoding off** on MI350X. Decode TPOT (ms) / output throughput (tok/s):
+
+| concurrency | baseline (no SD) | + EAGLE3 SD | TPOT speedup |
+|----|----|----|----|
+| 1  | 11.26 ms / 87 tok/s   | **5.34 ms / 182 tok/s**  | 2.11× |
+| 4  | 11.81 ms / 327 tok/s  | **8.76 ms / 435 tok/s**  | 1.35× |
+| 8  | 12.54 ms / 611 tok/s  | **9.82 ms / 773 tok/s**  | 1.28× |
+| 16 | 15.47 ms / 999 tok/s  | **11.10 ms / 1379 tok/s** | 1.39× |
+
+With the larger batch config (`--max-num-seqs 64 --max-num-batched-tokens
+16384`) SD keeps scaling on the 288 GB GPUs — concurrency 32: **2352 tok/s**
+(12.76 ms), concurrency 64: **3656 tok/s** (15.29 ms), both ahead of the no-SD
+baseline (1890 / 3348 tok/s). Mean acceptance length on these real multimodal
+prompts is ~2.3–2.4 (single-stream ~3.0).
+
 
   

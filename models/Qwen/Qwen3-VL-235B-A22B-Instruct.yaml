@@ -44,7 +44,7 @@ features:
       - "--mm-encoder-tp-mode"
       - "data"
   eagle3_speculative_decoding:
-    description: "EAGLE3 speculative decoding with the public RedHatAI draft model. Verified on AMD MI300X (gfx942/CDNA3) with the FP8 target. On ROCm this REQUIRES --attention-backend ROCM_AITER_FA; the default ROCM_ATTN path makes SD slower than baseline because the draft+verify forwards run every decode step (see vllm-project/vllm#46596)."
+    description: "EAGLE3 speculative decoding with the public RedHatAI draft model. Verified on AMD MI300X (gfx942/CDNA3) and MI350X/MI355X (gfx950/CDNA4) with the FP8 target. On ROCm this REQUIRES --attention-backend ROCM_AITER_FA; the default ROCM_ATTN path makes SD slower than baseline because the draft+verify forwards run every decode step (see vllm-project/vllm#46596). On MI350X/MI355X num_speculative_tokens=5 is the swept optimum (deeper draft than MI300X pays off on CDNA4)."
     args:
       - "--speculative-config"
       - '{"model":"RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3","method":"eagle3","num_speculative_tokens":4}'
@@ -207,6 +207,55 @@ guide: |
     --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["-rms_norm"],"pass_config":{"fuse_norm_quant":false}}' \
     --speculative-config '{"model":"RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3","method":"eagle3","num_speculative_tokens":4}'
   ```
+
+  ### MI350X/MI355X (FP8, EAGLE3 Speculative Decoding)
+
+  Same target + draft as the MI300X block, re-tuned on **MI350X/MI355X**
+  (gfx950 / CDNA4, 288 GB/GPU). The larger HBM and faster CDNA4 attention shift
+  the optimum two ways vs MI300X: a **deeper draft** (`num_speculative_tokens: 5`)
+  wins on TPOT, and the extra VRAM gives ample KV-cache headroom to scale running
+  batches well past `--max-num-seqs 32`. `--attention-backend ROCM_AITER_FA`
+  remains mandatory (see vllm-project/vllm#46596).
+
+  ```bash
+  VLLM_USE_V1=1 \
+  VLLM_WORKER_MULTIPROC_METHOD=spawn \
+  VLLM_ROCM_USE_AITER=1 \
+  VLLM_ROCM_USE_AITER_MHA=1 \
+  VLLM_ROCM_USE_AITER_RMSNORM=0 \
+  VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=0 \
+  VLLM_RPC_TIMEOUT=300000 \
+  vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
+    --tensor-parallel-size 8 \
+    --gpu-memory-utilization 0.94 \
+    --distributed-executor-backend mp \
+    --enable-chunked-prefill \
+    --max-model-len 16384 \
+    --max-num-seqs 64 \
+    --max-num-batched-tokens 16384 \
+    --mm-encoder-tp-mode data \
+    --enable-expert-parallel \
+    --attention-backend ROCM_AITER_FA \
+    --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["-rms_norm"],"pass_config":{"fuse_norm_quant":false}}' \
+    --speculative-config '{"model":"RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3","method":"eagle3","num_speculative_tokens":5}'
+  ```
+
+  **Measured impact (MI350X, FP8, EAGLE3, padded-ISL MMMU, ISL 1024 / OSL 512)** —
+  SD (`num_speculative_tokens: 5`) vs the same target with speculative decoding
+  **off** on MI350X. Decode TPOT (ms) / output throughput (tok/s):
+
+  | concurrency | baseline (no SD) | + EAGLE3 SD | TPOT speedup |
+  |----|----|----|----|
+  | 1  | 11.26 ms / 87 tok/s   | **5.34 ms / 182 tok/s**  | 2.11× |
+  | 4  | 11.81 ms / 327 tok/s  | **8.76 ms / 435 tok/s**  | 1.35× |
+  | 8  | 12.54 ms / 611 tok/s  | **9.82 ms / 773 tok/s**  | 1.28× |
+  | 16 | 15.47 ms / 999 tok/s  | **11.10 ms / 1379 tok/s** | 1.39× |
+
+  With the larger batch config above (`--max-num-seqs 64 --max-num-batched-tokens
+  16384`) SD keeps scaling on the 288 GB GPUs: at concurrency 32 it reaches
+  **2352 tok/s** (12.76 ms TPOT) and at 64 **3656 tok/s** (15.29 ms) — still
+  ahead of the no-SD baseline (1890 / 3348 tok/s respectively). Mean acceptance
+  length on these real multimodal prompts is ~2.3–2.4 (single-stream ~3.0).
 
   ## Configuration Tips
 
