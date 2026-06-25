@@ -43,16 +43,22 @@ features:
     args:
       - "--mm-encoder-tp-mode"
       - "data"
-  eagle3_speculative_decoding:
-    description: "EAGLE3 speculative decoding with the public RedHatAI draft model. Verified on AMD MI300X (gfx942/CDNA3) and MI350X/MI355X (gfx950/CDNA4) with the FP8 target. On ROCm this REQUIRES --attention-backend ROCM_AITER_FA; the default ROCM_ATTN path makes SD slower than baseline because the draft+verify forwards run every decode step (see vllm-project/vllm#46596). On MI350X/MI355X num_speculative_tokens=5 is the swept optimum (deeper draft than MI300X pays off on CDNA4)."
+  spec_decoding:
+    description: "EAGLE3 speculative decoding with the public RedHatAI draft (FP8 target). On ROCm it requires --attention-backend ROCM_AITER_FA, applied automatically on AMD (the default ROCM_ATTN path makes SD slower than baseline — see vllm-project/vllm#46596). Verified on AMD: MI300X (num_speculative_tokens=4) and MI355X (num_speculative_tokens=5 is the swept optimum on CDNA4) — see the guide for the full per-GPU server configs."
     args:
       - "--speculative-config"
       - '{"model":"RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3","method":"eagle3","num_speculative_tokens":4}'
-      - "--attention-backend"
-      - "ROCM_AITER_FA"
+    hardware_overrides:
+      amd:
+        args:
+          - "--speculative-config"
+          - '{"model":"RedHatAI/Qwen3-VL-235B-A22B-Instruct-speculator.eagle3","method":"eagle3","num_speculative_tokens":4}'
+          - "--attention-backend"
+          - "ROCM_AITER_FA"
 
 opt_in_features:
   - text_only
+  - spec_decoding
 
 variants:
   default:
@@ -168,10 +174,11 @@ guide: |
 
   ### MI300X/MI325X/MI355X (BF16)
   ```bash
-  MIOPEN_USER_DB_PATH="$(pwd)/miopen" \
-  MIOPEN_FIND_MODE=FAST \
-  VLLM_ROCM_USE_AITER=1 \
-  SAFETENSORS_FAST_GPU=1 \
+  export MIOPEN_USER_DB_PATH="$(pwd)/miopen"
+  export MIOPEN_FIND_MODE=FAST
+  export VLLM_ROCM_USE_AITER=1
+  export SAFETENSORS_FAST_GPU=1
+
   vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct \
     --tensor-parallel 4 \
     --mm-encoder-tp-mode data
@@ -186,13 +193,14 @@ guide: |
   halves SD TPOT vs the default selection.
 
   ```bash
-  VLLM_USE_V1=1 \
-  VLLM_WORKER_MULTIPROC_METHOD=spawn \
-  VLLM_ROCM_USE_AITER=1 \
-  VLLM_ROCM_USE_AITER_MHA=1 \
-  VLLM_ROCM_USE_AITER_RMSNORM=0 \
-  VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=0 \
-  VLLM_RPC_TIMEOUT=300000 \
+  export VLLM_USE_V1=1
+  export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  export VLLM_ROCM_USE_AITER=1
+  export VLLM_ROCM_USE_AITER_MHA=1
+  export VLLM_ROCM_USE_AITER_RMSNORM=0
+  export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=0
+  export VLLM_RPC_TIMEOUT=300000
+
   vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
     --tensor-parallel-size 8 \
     --gpu-memory-utilization 0.94 \
@@ -218,13 +226,14 @@ guide: |
   remains mandatory (see vllm-project/vllm#46596).
 
   ```bash
-  VLLM_USE_V1=1 \
-  VLLM_WORKER_MULTIPROC_METHOD=spawn \
-  VLLM_ROCM_USE_AITER=1 \
-  VLLM_ROCM_USE_AITER_MHA=1 \
-  VLLM_ROCM_USE_AITER_RMSNORM=0 \
-  VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=0 \
-  VLLM_RPC_TIMEOUT=300000 \
+  export VLLM_USE_V1=1
+  export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  export VLLM_ROCM_USE_AITER=1
+  export VLLM_ROCM_USE_AITER_MHA=1
+  export VLLM_ROCM_USE_AITER_RMSNORM=0
+  export VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=0
+  export VLLM_RPC_TIMEOUT=300000
+
   vllm serve Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
     --tensor-parallel-size 8 \
     --gpu-memory-utilization 0.94 \
